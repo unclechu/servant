@@ -32,18 +32,24 @@ module Servant.Server.Internal
   , module Servant.Server.Internal.ServerError
   ) where
 
+import           Control.Applicative
+                 ((<|>))
 import           Control.Monad
                  (join, when)
 import           Control.Monad.Trans
                  (liftIO)
 import           Control.Monad.Trans.Resource
                  (runResourceT)
+import           Data.Bifunctor
+                 (bimap)
 import qualified Data.ByteString                            as B
 import qualified Data.ByteString.Builder                    as BB
 import qualified Data.ByteString.Char8                      as BC8
 import qualified Data.ByteString.Lazy                       as BL
 import           Data.Either
                  (partitionEithers)
+import           Data.Function
+                 ((&))
 import           Data.Maybe
                  (fromMaybe, isNothing, mapMaybe, maybeToList)
 import           Data.Semigroup
@@ -64,9 +70,11 @@ import           Network.HTTP.Types                         hiding
 import           Network.Socket
                  (SockAddr)
 import           Network.Wai
-                 (Application, Request, httpVersion, isSecure, lazyRequestBody,
-                 queryString, remoteHost, requestBody, requestHeaders,
-                 requestMethod, responseLBS, responseStream, vault)
+                 (Application, Request, RequestBodyLength (KnownLength),
+                 httpVersion, isSecure, lazyRequestBody, queryString, remoteHost,
+                 requestBody, requestBodyLength, requestHeaders, requestMethod,
+                 responseLBS, responseStream,
+                 vault)
 import           Prelude ()
 import           Prelude.Compat
 import           Servant.API
@@ -624,12 +632,13 @@ instance HasServer Raw context where
 -- > server = postBook
 -- >   where postBook :: Book -> Handler Book
 -- >         postBook book = ...insert into your db...
-instance ( AllCTUnrender list a, HasServer api context, SBoolI (FoldLenient mods)
+instance ( AllCTUnrender list a, HasServer api context
+         , SBoolI (FoldRequired mods), SBoolI (FoldLenient mods)
          , HasContextEntry (MkContextWithErrorFormatter context) ErrorFormatters
          ) => HasServer (ReqBody' mods list a :> api) context where
 
   type ServerT (ReqBody' mods list a :> api) m =
-    If (FoldLenient mods) (Either String a) a -> ServerT api m
+    RequestArgument mods a -> ServerT api m
 
   hoistServerWithContext _ pc nt s = hoistServerWithContext (Proxy :: Proxy api) pc nt . s
 
@@ -641,25 +650,48 @@ instance ( AllCTUnrender list a, HasServer api context, SBoolI (FoldLenient mods
       formatError = bodyParserErrorFormatter $ getContextEntry (mkContextWithErrorFormatter context)
 
       -- Content-Type check, we only lookup we can try to parse the request body
-      ctCheck = withRequest $ \ request -> do
-        -- See HTTP RFC 2616, section 7.2.1
-        -- http://www.w3.org/Protocols/rfc2616/rfc2616-sec7.html#sec7.2.1
-        -- See also "W3C Internet Media Type registration, consistency of use"
-        -- http://www.w3.org/2001/tag/2002/0129-mime
-        let contentTypeH = fromMaybe "application/octet-stream"
-                         $ lookup hContentType $ requestHeaders request
-        case canHandleCTypeH (Proxy :: Proxy list) (cs contentTypeH) :: Maybe (BL.ByteString -> Either String a) of
-          Nothing -> delayedFail err415
-          Just f  -> return f
+      ctCheck = withRequest $ \ request ->
+        let
+          contentTypeH = lookup hContentType $ requestHeaders request
+
+          -- See HTTP RFC 2616, section 7.2.1
+          -- http://www.w3.org/Protocols/rfc2616/rfc2616-sec7.html#sec7.2.1
+          -- See also "W3C Internet Media Type registration, consistency of use"
+          -- http://www.w3.org/2001/tag/2002/0129-mime
+          contentTypeH' = fromMaybe "application/octet-stream" contentTypeH
+
+          canHandleContentTypeH :: Maybe (BL.ByteString -> Either String a)
+          canHandleContentTypeH = canHandleCTypeH (Proxy :: Proxy list) (cs contentTypeH')
+
+          -- In case ReqBody' is Optional and neither request body nor Content-Type header was provided.
+          noOptionalReqBody =
+            case (sbool :: SBool (FoldRequired mods), contentTypeH, requestBodyLength request) of
+                 (SFalse, Nothing, KnownLength 0) -> Just . const $ Left "This value does not matter (it is ignored)"
+                 _ -> Nothing
+        in
+          case canHandleContentTypeH <|> noOptionalReqBody of
+            Nothing -> delayedFail err415
+            Just f  -> return f
 
       -- Body check, we get a body parsing functions as the first argument.
       bodyCheck f = withRequest $ \ request -> do
         mrqbody <- f <$> liftIO (lazyRequestBody request)
-        case sbool :: SBool (FoldLenient mods) of
-          STrue -> return mrqbody
-          SFalse -> case mrqbody of
-            Left e  -> delayedFailFatal $ formatError rep request e
-            Right v -> return v
+
+        let
+          hasReqBody =
+            case requestBodyLength request of
+              KnownLength 0 -> False
+              _             -> True
+
+          serverErr :: String -> ServerError
+          serverErr = formatError rep request . cs
+
+        mrqbody & case (sbool :: SBool (FoldRequired mods), sbool :: SBool (FoldLenient mods), hasReqBody) of
+          (STrue,  STrue,  _)     -> return . bimap cs id
+          (STrue,  SFalse, _)     -> either (delayedFailFatal . serverErr) return
+          (SFalse, _,      False) -> return . const Nothing
+          (SFalse, STrue,  True)  -> return . Just . bimap cs id
+          (SFalse, SFalse, True)  -> either (delayedFailFatal . serverErr) (return . Just)
 
 instance
     ( FramingUnrender framing, FromSourceIO chunk a, MimeUnrender ctype chunk
